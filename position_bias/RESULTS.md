@@ -29,3 +29,9 @@ No model runs recorded yet.
 - `python position_bias/scripts/run_jacobian.py --help` passed.
 - `python -m pytest position_bias/tests` was not run locally because `pytest` is not installed in this environment.
 - GPT-2 Jacobian smoke/full runs were not run locally because this environment does not have `torch`, `transformers`, or a Colab T4 GPU.
+
+## Phase 2 Implementation Notes
+
+- Added resumable QA evaluation, exact-prompt gold-span Jacobian, and correlation-analysis scripts.
+- Local verification remains limited to compile and pure-Python/direct tests because this environment does not have `pytest`, `torch`, `transformers`, or `matplotlib` installed.
+- Colab should run the notebook smoke cells before full Task A/B/C runs.

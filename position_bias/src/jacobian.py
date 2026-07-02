@@ -7,6 +7,7 @@ import json
 import os
 import platform
 import random
+import re
 import sys
 import time
 from collections.abc import Sequence as RuntimeSequence
@@ -16,7 +17,7 @@ from typing import Any, Iterable, Iterator, Mapping, MutableMapping, Sequence
 
 import numpy as np
 
-from prompts import build_nq_prompt, gold_document_indices
+from prompts import DocumentSpan, build_nq_prompt, build_nq_prompt_with_spans, gold_document_indices
 
 
 DEFAULT_DATA_RELATIVE = Path(
@@ -72,6 +73,29 @@ def find_default_data_file(project_root: Path | None = None) -> Path:
         if candidate.exists():
             return candidate
     return candidates[0] if candidates else DEFAULT_DATA_RELATIVE
+
+
+def safe_model_name(model_name: str) -> str:
+    return model_name.replace("/", "__").replace("\\", "__").replace(":", "_")
+
+
+def data_file_info(path: str | Path) -> dict[str, int | str]:
+    """Infer document count and gold position from Liu NQ file names."""
+    path_obj = Path(path)
+    match = re.search(r"(\d+)_total_documents_gold_at_(\d+)", path_obj.name)
+    if not match:
+        match = re.search(r"(\d+)_total_documents.*gold_at_(\d+)", str(path_obj))
+    if not match:
+        raise ValueError(f"Could not infer doc count/gold position from {path_obj}")
+    return {
+        "doc_count": int(match.group(1)),
+        "gold_position": int(match.group(2)),
+        "file_name": path_obj.name,
+    }
+
+
+def target_n_examples(n_examples: int, smoke: bool, smoke_n: int = 5) -> int:
+    return min(n_examples, smoke_n) if smoke else n_examples
 
 
 def iter_nq_examples(path: str | Path) -> Iterator[dict[str, Any]]:
@@ -148,6 +172,78 @@ def tokenize_prompt_exactly(
     return input_ids[:, :seq_len], attention_mask[:, :seq_len] if attention_mask is not None else None, token_count
 
 
+def model_context_limit(tokenizer: Any, model: Any | None = None) -> int | None:
+    """Return a sane context limit when tokenizer/model expose one."""
+    candidates: list[int] = []
+    tokenizer_limit = getattr(tokenizer, "model_max_length", None)
+    if isinstance(tokenizer_limit, int) and 0 < tokenizer_limit < 1_000_000:
+        candidates.append(tokenizer_limit)
+
+    config = getattr(model, "config", None)
+    if config is not None:
+        for attr in ("max_position_embeddings", "n_positions", "seq_length"):
+            value = getattr(config, attr, None)
+            if isinstance(value, int) and value > 0:
+                candidates.append(value)
+    return min(candidates) if candidates else None
+
+
+def tokenize_prompt_natural(tokenizer: Any, prompt: str) -> tuple[Any, Any | None, list[tuple[int, int]]]:
+    """Tokenize a full prompt without truncation and return offsets for span mapping."""
+    encoded = tokenizer(
+        prompt,
+        return_tensors="pt",
+        add_special_tokens=True,
+        truncation=False,
+        return_offsets_mapping=True,
+    )
+    if "offset_mapping" not in encoded:
+        raise ValueError("Tokenizer did not return offset_mapping; use a fast tokenizer.")
+    offsets_raw = encoded.pop("offset_mapping")[0].tolist()
+    offsets = [(int(start), int(end)) for start, end in offsets_raw]
+    return encoded["input_ids"], encoded.get("attention_mask"), offsets
+
+
+def token_span_from_char_span(offsets: Sequence[Sequence[int]], start: int, end: int) -> tuple[int, int]:
+    """Map a character span to the token span whose offsets overlap it."""
+    hits: list[int] = []
+    for i, pair in enumerate(offsets):
+        token_start, token_end = int(pair[0]), int(pair[1])
+        if token_end <= token_start:
+            continue
+        if token_end > start and token_start < end:
+            hits.append(i)
+    if not hits:
+        raise ValueError(f"No tokens overlapped character span [{start}, {end}).")
+    return hits[0], hits[-1] + 1
+
+
+def normalize_for_span_check(text: str) -> str:
+    return " ".join(text.split())
+
+
+def decode_and_validate_span(
+    tokenizer: Any,
+    input_ids: Any,
+    token_span: tuple[int, int],
+    document_text: str,
+) -> str:
+    """Decode a token span and assert it contains the original document text."""
+    start, end = token_span
+    token_ids = input_ids[0, start:end]
+    if hasattr(token_ids, "tolist"):
+        token_ids = token_ids.tolist()
+    decoded = tokenizer.decode(token_ids, skip_special_tokens=True)
+    expected = normalize_for_span_check(document_text)
+    observed = normalize_for_span_check(decoded)
+    if expected not in observed:
+        raise ValueError(
+            "Decoded gold token span does not contain the gold document text. "
+            f"Span={token_span}, expected prefix={expected[:120]!r}, decoded prefix={observed[:120]!r}"
+        )
+    return decoded
+
+
 def measure_jacobian_curve(model: Any, input_ids: Any, attention_mask: Any | None = None) -> np.ndarray:
     """Compute rho[j] = ||d sum(logits_last) / d input_embedding[j]||_2."""
     import torch
@@ -220,6 +316,11 @@ def atomic_write_text(path: Path, text: str) -> None:
     os.replace(temp_path, path)
 
 
+def append_text_atomic(path: Path, text: str) -> None:
+    existing = path.read_text(encoding="utf-8") if path.exists() else ""
+    atomic_write_text(path, existing + text)
+
+
 def atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
     atomic_write_text(path, json.dumps(payload, indent=2, sort_keys=True) + "\n")
 
@@ -245,11 +346,23 @@ def write_records(path: Path, records: Sequence[Mapping[str, Any]]) -> None:
     atomic_write_text(path, lines)
 
 
+def write_jsonl_atomic(path: Path, records: Sequence[Mapping[str, Any]]) -> None:
+    write_records(path, records)
+
+
 def load_records(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
         return []
     with path.open("r", encoding="utf-8") as handle:
         return [json.loads(line) for line in handle if line.strip()]
+
+
+def load_jsonl_records(path: str | Path) -> list[dict[str, Any]]:
+    return load_records(Path(path))
+
+
+def append_results_block(project_root: Path, block: str) -> None:
+    append_text_atomic(project_root / "RESULTS.md", block)
 
 
 def load_checkpoint(out_dir: str | Path) -> tuple[np.ndarray | None, list[dict[str, Any]], dict[str, Any]]:
@@ -322,6 +435,34 @@ def save_checkpoint(
         atomic_save_npz(out_path / "log10_percentiles.npz", **summary)
         if plot_title:
             save_plot(out_path, curve_array, plot_title)
+
+
+def first_gold_span(spans: Sequence[DocumentSpan]) -> DocumentSpan:
+    gold_spans = [span for span in spans if span.isgold]
+    if not gold_spans:
+        raise ValueError("Example has no gold document span.")
+    return gold_spans[0]
+
+
+def prompt_and_gold_span(example: Mapping[str, Any]) -> tuple[str, list[DocumentSpan], DocumentSpan]:
+    prompt, spans = build_nq_prompt_with_spans(str(example["question"]), example["ctxs"])
+    return prompt, spans, first_gold_span(spans)
+
+
+def summarize_jacobian_span(curve: np.ndarray, token_span: tuple[int, int]) -> dict[str, float | list[int]]:
+    start, end = token_span
+    if start < 0 or end > len(curve) or start >= end:
+        raise ValueError(f"Invalid token span {token_span} for curve length {len(curve)}.")
+    span_curve = curve[start:end].astype(np.float64, copy=False)
+    clipped = np.clip(span_curve, 1e-300, None)
+    return {
+        "gold_token_span": [int(start), int(end)],
+        "jac_gold_mean": float(np.mean(span_curve)),
+        "jac_gold_max": float(np.max(span_curve)),
+        "jac_gold_logmean": float(np.mean(np.log10(clipped))),
+        "jac_last_token": float(curve[-1]),
+        "jac_prompt_median": float(np.median(curve)),
+    }
 
 
 def build_record(
