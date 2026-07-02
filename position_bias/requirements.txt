@@ -1,0 +1,8 @@
+torch==2.5.1
+transformers==4.48.0
+numpy==1.26.4
+scipy==1.14.1
+matplotlib==3.9.2
+tqdm==4.67.1
+regex==2024.11.6
+pytest==8.3.4
